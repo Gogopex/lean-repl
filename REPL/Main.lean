@@ -166,10 +166,10 @@ def collectRootGoalsAsSorries (trees : List InfoTree) (env? : Option Environment
 
 private def collectFVarsAux : Expr → NameSet
   | .fvar fvarId => NameSet.empty.insert fvarId.name
-  | .app fm arg => (collectFVarsAux fm).union $ collectFVarsAux arg
-  | .lam _ binderType body _ => (collectFVarsAux binderType).union $ collectFVarsAux body
-  | .forallE _ binderType body _ => (collectFVarsAux binderType).union $ collectFVarsAux body
-  | .letE _ type value body _ => ((collectFVarsAux type).union $ collectFVarsAux value).union $ collectFVarsAux body
+  | .app fm arg => (collectFVarsAux fm).merge $ collectFVarsAux arg
+  | .lam _ binderType body _ => (collectFVarsAux binderType).merge $ collectFVarsAux body
+  | .forallE _ binderType body _ => (collectFVarsAux binderType).merge $ collectFVarsAux body
+  | .letE _ type value body _ => ((collectFVarsAux type).merge $ collectFVarsAux value).merge $ collectFVarsAux body
   | .mdata _ expr => collectFVarsAux expr
   | .proj _ _ struct => collectFVarsAux struct
   | _ => NameSet.empty
@@ -347,7 +347,7 @@ def replaceWithPrint (f? : Expr → MetaM (Option Expr)) (e : Expr) : MetaM Expr
     | .forallE _ d b _ => let d ← replaceWithPrint f? d; let b ← replaceWithPrint f? b; return e.updateForallE! d b
     | .lam _ d b _     => let d ← replaceWithPrint f? d; let b ← replaceWithPrint f? b; return e.updateLambdaE! d b
     | .mdata _ b       => let b ← replaceWithPrint f? b; return e.updateMData! b
-    | .letE _ t v b _  => let t ← replaceWithPrint f? t; let v ← replaceWithPrint f? v; let b ← replaceWithPrint f? b; return e.updateLet! t v b
+    | .letE _ t v b _  => let t ← replaceWithPrint f? t; let v ← replaceWithPrint f? v; let b ← replaceWithPrint f? b; return e.updateLetE! t v b
     | .app f a         => let f ← replaceWithPrint f? f; let a ← replaceWithPrint f? a; return e.updateApp! f a
     | .proj _ _ b      => let b ← replaceWithPrint f? b; return e.updateProj! b
     | e                => return e
@@ -361,7 +361,7 @@ def replaceMVarsWithSorry (e : Expr) : MetaM Expr := do
   | .forallE _ d b _ => let d ← replaceMVarsWithSorry d; let b ← replaceMVarsWithSorry b; return e.updateForallE! d b
   | .lam _ d b _     => let d ← replaceMVarsWithSorry d; let b ← replaceMVarsWithSorry b; return e.updateLambdaE! d b
   | .mdata _ b       => let b ← replaceMVarsWithSorry b; return e.updateMData! b
-  | .letE _ t v b _  => let t ← replaceMVarsWithSorry t; let v ← replaceMVarsWithSorry v; let b ← replaceMVarsWithSorry b; return e.updateLet! t v b
+  | .letE _ t v b _  => let t ← replaceMVarsWithSorry t; let v ← replaceMVarsWithSorry v; let b ← replaceMVarsWithSorry b; return e.updateLetE! t v b
   | .app f a         => let f ← replaceMVarsWithSorry f; let a ← replaceMVarsWithSorry a; return e.updateApp! f a
   | .proj _ _ b      => let b ← replaceMVarsWithSorry b; return e.updateProj! b
   | e                => return e
