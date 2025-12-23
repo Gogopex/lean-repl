@@ -195,6 +195,89 @@ private def abstractAllLambdaFVars (e : Expr) : MetaM Expr := do
     e' ← Meta.mkLambdaFVars fvars e'
   return e'
 
+def binderInfoToString : BinderInfo → String
+  | .default => "default"
+  | .implicit => "implicit"
+  | .strictImplicit => "strictImplicit"
+  | .instImplicit => "instImplicit"
+
+def literalToString : Literal → String
+  | .natVal n => s!"nat:{n}"
+  | .strVal s => s!"str:{s}"
+
+def exprToDAG (e : Expr) : MetaM ExprDAG.Json := do
+  let nodesRef : IO.Ref (List (String × ExprNode.Json)) ← IO.mkRef []
+  let counterRef : IO.Ref Nat ← IO.mkRef 0
+
+  let rec go (expr : Expr) : MetaM String := do
+    let idx ← counterRef.modifyGet fun n => (n, n + 1)
+    let nodeId := s!"n{idx}"
+
+    let node ← match expr with
+    | .bvar idx =>
+      pure { kind := "bvar", deBruijnIdx := some idx : ExprNode.Json }
+    | .fvar fvarId =>
+      pure { kind := "fvar", fvarId := some fvarId.name.toString : ExprNode.Json }
+    | .mvar mvarId =>
+      pure { kind := "mvar", name := some mvarId.name.toString : ExprNode.Json }
+    | .sort lvl =>
+      pure { kind := "sort", levelVal := some (toString lvl) : ExprNode.Json }
+    | .const name lvls =>
+      pure { kind := "const", name := some name.toString, levels := some (lvls.map toString) : ExprNode.Json }
+    | .app fn arg => do
+      let fnId ← go fn
+      let argId ← go arg
+      pure { kind := "app", fn := some fnId, arg := some argId : ExprNode.Json }
+    | .lam name ty body bi => do
+      let tyId ← go ty
+      let bodyId ← go body
+      pure { kind := "lam", binderName := some name.toString, binderType := some tyId,
+             body := some bodyId, binderInfo := some (binderInfoToString bi) : ExprNode.Json }
+    | .forallE name ty body bi => do
+      let tyId ← go ty
+      let bodyId ← go body
+      pure { kind := "forallE", binderName := some name.toString, binderType := some tyId,
+             body := some bodyId, binderInfo := some (binderInfoToString bi) : ExprNode.Json }
+    | .letE name ty val body _ => do
+      let tyId ← go ty
+      let valId ← go val
+      let bodyId ← go body
+      pure { kind := "letE", binderName := some name.toString, binderType := some tyId,
+             value := some valId, body := some bodyId : ExprNode.Json }
+    | .lit l =>
+      pure { kind := "lit", litVal := some (literalToString l) : ExprNode.Json }
+    | .mdata _ inner =>
+      return ← go inner
+    | .proj structName idx struct => do
+      let structId ← go struct
+      pure { kind := "proj", structName := some structName.toString, projIdx := some idx,
+             projExpr := some structId : ExprNode.Json }
+
+    nodesRef.modify fun nodes => (nodeId, node) :: nodes
+    pure nodeId
+
+  let rootId ← go e
+  let nodes ← nodesRef.get
+  pure { rootId := rootId, nodes := nodes }
+
+def getProofTerm (proofState : ProofSnapshot) : M m (Option ExprDAG.Json) := do
+  match proofState.tacticState.goals with
+  | [] =>
+    let res := proofState.runMetaM do
+      match proofState.rootGoals with
+      | [goalId] =>
+        match proofState.metaState.mctx.getExprAssignmentCore? goalId with
+        | none => return none
+        | some pf => do
+          let pf ← instantiateMVars pf
+          let pf ← goalId.withContext $ abstractAllLambdaFVars pf
+          if pf.hasExprMVar then return none
+          if pf.hasSorry then return none
+          some <$> exprToDAG pf
+      | _ => return none
+    return (← res).fst
+  | _ => return none
+
 /--
 Evaluates the current status of a proof, returning a string description.
 Main states include:
@@ -436,6 +519,29 @@ partial def getFullAssignmentLambda (mctx : MetavarContext) (mvarId : MVarId) : 
           | none => return none
         | none    => pure none
 
+def getPartialProofTerm (proofState : ProofSnapshot) : M m (Option PartialProofTerm.Json) := do
+  let res := proofState.runMetaM do
+    match proofState.rootGoals with
+    | [goalId] =>
+      match ← getFullAssignmentLambda proofState.metaState.mctx goalId with
+      | none => return none
+      | some pf => do
+        let pf ← instantiateMVars pf
+        let pf ← goalId.withContext $ abstractAllLambdaFVars pf
+        let mvars ← Meta.getMVars pf
+        let mvarInfos ← mvars.toList.mapM fun mvar => do
+          let decl ← mvar.getDecl
+          let typeStr ← goalId.withContext $ Meta.ppExpr decl.type
+          pure { mvarId := mvar.name.toString, type := typeStr.pretty : MvarInfo.Json }
+        let dag ← exprToDAG pf
+        return some {
+          proofTerm := dag,
+          openMvars := mvarInfos,
+          isComplete := !pf.hasExprMVar
+        }
+    | _ => return none
+  return (← res).fst
+
 /-- Does the expression `e` contain the metavariable `t`? -/
 private def findInExpr (t : MVarId) : Expr → Bool
   | Expr.mvar mid          => mid == t
@@ -577,6 +683,8 @@ def createProofStepReponse (proofState : ProofSnapshot) (old? : Option ProofSnap
     let goalInfo ← printGoalInfo ctx mvarId
     return goalInfo)
   let mctxAfterJson ← MetavarContext.toJson proofState.metaState.mctx ctx
+  let proofTermDag ← getProofTerm proofState
+  let partialProofTermDag ← getPartialProofTerm proofState
   return {
     proofState := proofStateId
     goals := (← proofState.ppGoals).map fun s => s!"{s}"
@@ -585,10 +693,10 @@ def createProofStepReponse (proofState : ProofSnapshot) (old? : Option ProofSnap
     traces
     goalInfos
     mctxAfter := mctxAfterJson
-    -- proofStatus := (← getProofStatus proofState)
     proofStatus := "N/A"
     stepVerification := (← verifyGoalAssignment proofState old?)
-    -- stepVerification := "N/A"
+    proofTerm := proofTermDag
+    partialProofTerm := partialProofTermDag
   }
 
 /-- Pickle a `CommandSnapshot`, generating a JSON response. -/

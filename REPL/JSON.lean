@@ -199,6 +199,42 @@ structure MetavarContext.Json where
   decls : Array MetavarDecl.Json
 deriving ToJson, FromJson
 
+structure ExprNode.Json where
+  kind : String
+  name : Option String := none
+  levels : Option (List String) := none
+  fn : Option String := none
+  arg : Option String := none
+  binderName : Option String := none
+  binderType : Option String := none
+  body : Option String := none
+  binderInfo : Option String := none
+  value : Option String := none
+  deBruijnIdx : Option Nat := none
+  fvarId : Option String := none
+  litVal : Option String := none
+  structName : Option String := none
+  projIdx : Option Nat := none
+  projExpr : Option String := none
+  levelVal : Option String := none
+deriving ToJson, FromJson
+
+structure ExprDAG.Json where
+  rootId : String
+  nodes : List (String × ExprNode.Json)
+deriving ToJson, FromJson
+
+structure MvarInfo.Json where
+  mvarId : String
+  type : String
+deriving ToJson, FromJson
+
+structure PartialProofTerm.Json where
+  proofTerm : ExprDAG.Json
+  openMvars : List MvarInfo.Json
+  isComplete : Bool
+deriving ToJson, FromJson
+
 def MetavarContext.toJson (mctx : MetavarContext) (ctx : ContextInfo) : IO MetavarContext.Json := do
   let mut decls := #[]
   for (mvarId, decl) in mctx.decls do
@@ -269,6 +305,8 @@ structure ProofStepResponse where
   mctxAfter : Option MetavarContext.Json
   proofStatus : String
   stepVerification : String
+  proofTerm : Option ExprDAG.Json := none
+  partialProofTerm : Option PartialProofTerm.Json := none
 deriving ToJson, FromJson
 
 instance : ToJson ProofStepResponse where
@@ -281,7 +319,9 @@ instance : ToJson ProofStepResponse where
     Json.nonemptyList "traces" r.traces,
     match r.mctxAfter with | some mctxAfter => [("mctxAfter", toJson mctxAfter)] | none => [],
     [("proofStatus", r.proofStatus)],
-    [("stepVerification", r.stepVerification)]
+    [("stepVerification", r.stepVerification)],
+    match r.proofTerm with | some pt => [("proofTerm", toJson pt)] | none => [],
+    match r.partialProofTerm with | some ppt => [("partialProofTerm", toJson ppt)] | none => []
   ]
 
 /-- Json wrapper for an error. -/
