@@ -260,6 +260,102 @@ def exprToDAG (e : Expr) : MetaM ExprDAG.Json := do
   let nodes ← nodesRef.get
   pure { rootId := rootId, nodes := nodes }
 
+def binderInfoFromString (s : String) : BinderInfo :=
+  match s with
+  | "implicit" => .implicit
+  | "strictImplicit" => .strictImplicit
+  | "instImplicit" => .instImplicit
+  | _ => .default
+
+def literalFromString (s : String) : Option Literal :=
+  if s.startsWith "nat:" then
+    (s.drop 4).toNat?.map Literal.natVal
+  else if s.startsWith "str:" then
+    some (Literal.strVal (s.drop 4))
+  else
+    none
+
+partial def dagToExprGo (nodeMap : Std.HashMap String ExprNode.Json) (nodeId : String) : Except String Expr := do
+  match nodeMap[nodeId]? with
+  | none => throw s!"Node not found: {nodeId}"
+  | some node =>
+    match node.kind with
+    | "bvar" =>
+      match node.deBruijnIdx with
+      | some idx => pure (.bvar idx)
+      | none => throw "bvar missing deBruijnIdx"
+    | "fvar" =>
+      match node.fvarId with
+      | some id => pure (.fvar (FVarId.mk (Name.mkSimple id)))
+      | none => throw "fvar missing fvarId"
+    | "mvar" =>
+      match node.name with
+      | some name => pure (.mvar (MVarId.mk (Name.mkSimple name)))
+      | none => throw "mvar missing name"
+    | "sort" =>
+      match node.levelVal with
+      | some "0" => pure (.sort .zero)
+      | some "1" => pure (.sort (.succ .zero))
+      | some s => pure (.sort (.param (Name.mkSimple s)))
+      | none => throw "sort missing levelVal"
+    | "const" =>
+      match node.name with
+      | some name =>
+        let levels := node.levels.getD [] |>.map fun s =>
+          if s == "0" then Level.zero
+          else if s == "1" then Level.succ .zero
+          else Level.param (Name.mkSimple s)
+        let constName := name.splitOn "." |>.foldl (init := Name.anonymous) Name.mkStr
+        pure (.const constName levels)
+      | none => throw "const missing name"
+    | "app" =>
+      match node.fn, node.arg with
+      | some fnId, some argId =>
+        let fn ← dagToExprGo nodeMap fnId
+        let arg ← dagToExprGo nodeMap argId
+        pure (.app fn arg)
+      | _, _ => throw "app missing fn or arg"
+    | "lam" =>
+      match node.binderName, node.binderType, node.body with
+      | some name, some tyId, some bodyId =>
+        let ty ← dagToExprGo nodeMap tyId
+        let body ← dagToExprGo nodeMap bodyId
+        let bi := node.binderInfo.map binderInfoFromString |>.getD .default
+        pure (.lam (Name.mkSimple name) ty body bi)
+      | _, _, _ => throw "lam missing fields"
+    | "forallE" =>
+      match node.binderName, node.binderType, node.body with
+      | some name, some tyId, some bodyId =>
+        let ty ← dagToExprGo nodeMap tyId
+        let body ← dagToExprGo nodeMap bodyId
+        let bi := node.binderInfo.map binderInfoFromString |>.getD .default
+        pure (.forallE (Name.mkSimple name) ty body bi)
+      | _, _, _ => throw "forallE missing fields"
+    | "letE" =>
+      match node.binderName, node.binderType, node.value, node.body with
+      | some name, some tyId, some valId, some bodyId =>
+        let ty ← dagToExprGo nodeMap tyId
+        let val ← dagToExprGo nodeMap valId
+        let body ← dagToExprGo nodeMap bodyId
+        pure (.letE (Name.mkSimple name) ty val body false)
+      | _, _, _, _ => throw "letE missing fields"
+    | "lit" =>
+      match node.litVal >>= literalFromString with
+      | some lit => pure (.lit lit)
+      | none => throw "lit missing or invalid litVal"
+    | "proj" =>
+      match node.structName, node.projIdx, node.projExpr with
+      | some structName, some idx, some exprId =>
+        let expr ← dagToExprGo nodeMap exprId
+        pure (.proj (Name.mkStr1 structName) idx expr)
+      | _, _, _ => throw "proj missing fields"
+    | k => throw s!"Unknown node kind: {k}"
+
+def dagToExpr (dag : ExprDAG.Json) : Except String Expr :=
+  let nodeMap : Std.HashMap String ExprNode.Json :=
+    dag.nodes.foldl (init := {}) fun acc (id, node) => acc.insert id node
+  dagToExprGo nodeMap dag.rootId
+
 def getProofTerm (proofState : ProofSnapshot) : M m (Option ExprDAG.Json) := do
   match proofState.tacticState.goals with
   | [] =>
@@ -743,6 +839,38 @@ def pruneSnapshots (n : PruneSnapshots) : M m String := do
   | none => pure ()
   return "OK"
 
+def runDefEq (s : DefEq) : M IO (DefEqResponse ⊕ Error) := do
+  let cmdSnapshot ← match s.env with
+  | none => return .inr ⟨"DefEq requires an environment (env field must be specified)."⟩
+  | some i => do match (← get).cmdStates[i]? with
+    | some snap => pure snap
+    | none => return .inr ⟨"Unknown environment."⟩
+
+  let expr1 ← match dagToExpr s.expr1 with
+  | .ok e => pure e
+  | .error msg => return .inl { isDefEq := false, error := some s!"Failed to parse expr1: {msg}" }
+
+  let expr2 ← match dagToExpr s.expr2 with
+  | .ok e => pure e
+  | .error msg => return .inl { isDefEq := false, error := some s!"Failed to parse expr2: {msg}" }
+
+  let env := cmdSnapshot.cmdState.env
+  let coreCtx : Core.Context := {
+    fileName := "",
+    fileMap := default,
+  }
+  let coreState : Core.State := { env }
+
+  let result ← try
+    let (isEq, _) ← (Core.CoreM.toIO · coreCtx coreState) do
+      Meta.MetaM.run' do
+        Meta.isDefEq expr1 expr2
+    pure (.inl { isDefEq := isEq, error := none })
+  catch ex =>
+    pure (.inl { isDefEq := false, error := some s!"isDefEq check failed: {ex}" })
+
+  return result
+
 partial def removeChildren (t : InfoTree) : InfoTree :=
   match t with
   | InfoTree.context ctx t' => InfoTree.context ctx (removeChildren t')
@@ -875,6 +1003,7 @@ inductive Input
 | pickleProofSnapshot : REPL.PickleProofState → Input
 | unpickleProofSnapshot : REPL.UnpickleProofState → Input
 | pruneSnapshots : REPL.PruneSnapshots → Input
+| defEq : REPL.DefEq → Input
 
 /-- Parse a user input string to an input command. -/
 def parse (query : String) : IO Input := do
@@ -896,6 +1025,8 @@ def parse (query : String) : IO Input := do
     | .ok (r : REPL.Command) => return .command r
     | .error _ => match fromJson? j with
     | .ok (r : REPL.File) => return .file r
+    | .error _ => match fromJson? j with
+    | .ok (r : REPL.DefEq) => return .defEq r
     | .error _ => match fromJson? j with
     | .ok (r : REPL.PruneSnapshots) => return .pruneSnapshots r
     | .error e => throw <| IO.userError <| toString <| toJson <|
@@ -925,6 +1056,7 @@ where loop : M IO Unit := do
       | .pickleProofSnapshot r => return toJson (← pickleProofSnapshot r)
       | .unpickleProofSnapshot r => return toJson (← unpickleProofSnapshot r)
       | .pruneSnapshots r => return toJson (← pruneSnapshots r)
+      | .defEq r => return toJson (← runDefEq r)
     catch e => return toJson (⟨e.toString⟩ : Error)
   printFlush "\n" -- easier to parse the output if there are blank lines
   loop

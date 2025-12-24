@@ -348,4 +348,15 @@ structure UnpickleProofState where
   env : Option Nat
 deriving ToJson, FromJson
 
+structure DefEq where
+  env : Option Nat
+  expr1 : ExprDAG.Json
+  expr2 : ExprDAG.Json
+deriving ToJson, FromJson
+
+structure DefEqResponse where
+  isDefEq : Bool
+  error : Option String := none
+deriving ToJson, FromJson
+
 end REPL
